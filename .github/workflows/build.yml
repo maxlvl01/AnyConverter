@@ -1,0 +1,50 @@
+# Builds AnyConverter for Linux and Windows on GitHub's machines.
+# Push this folder to a GitHub repo, then open Actions -> "Build" -> Run workflow
+# (or push a tag like v1.0) and download the results from the run page.
+name: Build
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  linux:
+    # Older Ubuntu = binary works on more distros (needs glibc 2.35 or newer).
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: sudo apt-get update && sudo apt-get install -y python3-tk
+      - run: pip install pyinstaller
+      - run: pyinstaller --noconfirm --onefile --windowed --name AnyConverter anyconverter.py
+      - name: Smoke test (starts the app on a virtual screen)
+        run: |
+          sudo apt-get install -y xvfb
+          timeout 5 xvfb-run -a ./dist/AnyConverter || [ $? -eq 124 ]
+      - name: Package
+        run: |
+          mkdir AnyConverter-linux
+          cp dist/AnyConverter install_linux.sh AnyConverter-linux/
+          chmod +x AnyConverter-linux/*
+          tar czf AnyConverter-linux-x86_64.tar.gz AnyConverter-linux
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AnyConverter-linux-x86_64
+          path: AnyConverter-linux-x86_64.tar.gz
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pyinstaller
+      - run: pyinstaller --noconfirm --onefile --windowed --name AnyConverter anyconverter.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AnyConverter-windows
+          path: dist/AnyConverter.exe
