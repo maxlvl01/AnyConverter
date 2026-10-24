@@ -18,7 +18,7 @@ jobs:
         with:
           python-version: "3.12"
       - run: sudo apt-get update && sudo apt-get install -y python3-tk
-      - run: pip install pyinstaller
+      - run: pip install pyinstaller pillow pillow-heif pypdfium2 openpyxl
       - run: pyinstaller --noconfirm --onefile --windowed --name AnyConverter anyconverter.py
       - name: Smoke test (starts the app on a virtual screen)
         run: |
@@ -42,7 +42,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install pyinstaller
+      - run: pip install pyinstaller pillow pillow-heif pypdfium2 openpyxl
       - run: pyinstaller --noconfirm --onefile --windowed --name AnyConverter anyconverter.py
       - uses: actions/upload-artifact@v4
         with:

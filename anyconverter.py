@@ -1,16 +1,25 @@
-"""AnyConverter - convert any audio/video file into the format you want.
+"""AnyConverter - convert audio, video, images, PDFs, documents, spreadsheets,
+subtitles and archives into the format you want.
 
-Pure Python + tkinter (no pip installs needed). Uses FFmpeg under the hood,
-so FFmpeg must be installed and on your PATH (or placed next to this script).
+Python + tkinter. Audio, video and subtitles go through FFmpeg; documents,
+slides and spreadsheets through LibreOffice (both are offered for install when
+missing). Images, PDFs and data files need a few Python packages, which the
+built AnyConverter.exe already contains:
+      pip install pillow pillow-heif pypdfium2 openpyxl
 
 Run:  py anyconverter.py         (Windows)
       python3 anyconverter.py    (Linux; needs the python3-tk package)
 """
 
+import csv
+import importlib.util
+import io
 import json
 import os
 import queue
+import tarfile
 import tempfile
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 import re
 import shutil
@@ -136,32 +145,144 @@ def build_args(ext, q, info, copy="va"):
 # into time slices encoded side by side. Value = threads each slice uses well.
 SPLIT_ENCODERS = {"libtheora": 1, "libvpx-vp9": 2}
 
-VIDEO_FORMATS = ["mp4", "mkv", "mov", "webm", "ogv", "avi", "m4v", "flv", "wmv", "gif"]
+VIDEO_FORMATS = ["mp4", "mkv", "mov", "webm", "ogv", "avi", "m4v", "flv", "wmv"]
 AUDIO_FORMATS = ["mp3", "wav", "flac", "m4a", "aac", "ogg", "opus", "wma", "aiff"]
+IMAGE_FORMATS = ["png", "jpg", "webp", "avif", "gif", "bmp", "tiff", "ico"]
 
-MEDIA_EXTS = (
-    "*.mp4 *.mkv *.mov *.webm *.avi *.m4v *.flv *.wmv *.mpg *.mpeg *.3gp *.ts *.mts "
-    "*.m2ts *.vob *.ogv *.gif *.mp3 *.wav *.flac *.m4a *.aac *.ogg *.oga *.opus *.wma "
-    "*.aiff *.aif *.alac *.amr *.ac3 *.dts *.mka *.caf"
-)
-if os.name != "nt":   # Linux file names are case-sensitive: also match VIDEO.MP4
-    MEDIA_EXTS += " " + MEDIA_EXTS.upper()
+# Every format AnyConverter can write, grouped the way the "Convert to" list shows them.
+FORMAT_GROUPS = [
+    ("video", VIDEO_FORMATS),
+    ("audio", AUDIO_FORMATS),
+    ("image", IMAGE_FORMATS),
+    ("document", ["pdf", "docx", "odt", "rtf", "txt", "html"]),
+    ("slides", ["pptx", "odp"]),
+    ("spreadsheet", ["xlsx", "ods", "csv", "tsv", "json"]),
+    ("subtitles", ["srt", "vtt", "ass"]),
+    ("archive", ["zip", "tar.gz", "tar.xz", "tar"]),
+]
+
+# kind -> (extensions read as that kind, formats it can become)
+KINDS = {
+    "video": ("mp4 mkv mov webm avi m4v flv wmv mpg mpeg 3gp ts mts m2ts vob ogv gif",
+              VIDEO_FORMATS + AUDIO_FORMATS + ["gif"]),
+    "audio": ("mp3 wav flac m4a aac ogg oga opus wma aiff aif alac amr ac3 dts mka caf",
+              AUDIO_FORMATS),
+    "image": ("png jpg jpeg jfif webp avif bmp tif tiff ico heic heif tga psd",
+              IMAGE_FORMATS + ["pdf"]),
+    "pdf": ("pdf", ["png", "jpg", "webp", "tiff", "txt", "pdf"]),   # pdf: merge only
+    "document": ("docx doc odt rtf txt html htm", ["pdf", "docx", "odt", "rtf", "txt", "html"]),
+    "slides": ("pptx ppt odp", ["pdf", "pptx", "odp"]),
+    "spreadsheet": ("xlsx xls ods", ["pdf", "xlsx", "ods", "csv"]),
+    "data": ("csv tsv json", ["csv", "tsv", "json", "xlsx"]),
+    "subtitles": ("srt vtt ass ssa", ["srt", "vtt", "ass"]),
+    "archive": ("zip tar tar.gz tgz tar.xz txz tar.bz2 tbz2", ["zip", "tar.gz", "tar.xz", "tar"]),
+}
+KIND_OF = {e: k for k, (exts, _) in KINDS.items() for e in exts.split()}
+# Spellings of the same format, so png -> png isn't offered and jpeg -> jpg is.
+SAME = {"jpeg": "jpg", "jfif": "jpg", "tif": "tiff", "heif": "heic", "htm": "html",
+        "tgz": "tar.gz", "txz": "tar.xz", "tbz2": "tar.bz2", "aif": "aiff", "oga": "ogg"}
+COMPOUND_EXTS = ("tar.gz", "tar.xz", "tar.bz2")
+
+
+def split_ext(path):
+    """("holiday", "tar.gz") for .../holiday.tar.gz; extension in lower case."""
+    base = os.path.basename(path)
+    for c in COMPOUND_EXTS:
+        if base.lower().endswith("." + c) and len(base) > len(c) + 1:
+            return base[:-len(c) - 1], c
+    stem, e = os.path.splitext(base)
+    return stem, e[1:].lower()
+
+
+def outputs_for(path):
+    """Formats this file can be converted to. Unknown files are tried as media."""
+    ext = split_ext(path)[1]
+    kind = KIND_OF.get(ext, "video")
+    outs = list(KINDS[kind][1])
+    if ext == "gif":            # animations can also become still or animated images
+        outs = VIDEO_FORMATS + [f for f in IMAGE_FORMATS if f != "gif"]
+    elif ext == "xlsx":
+        outs = ["pdf", "ods", "csv", "tsv", "json"]
+    own = SAME.get(ext, ext)
+    return [f for f in outs if f != own or f == "pdf"]
+
+
+def engine_for(path, target):
+    """Which converter turns this file into target, or None if none can."""
+    if target not in outputs_for(path):
+        return None
+    ext = split_ext(path)[1]
+    kind = KIND_OF.get(ext, "video")
+    if kind == "image" or (ext == "gif" and target in IMAGE_FORMATS):
+        return "image"
+    if kind in ("video", "audio", "subtitles"):
+        return "ffmpeg"
+    if kind in ("pdf", "archive", "data"):
+        return kind
+    if ext == "xlsx" and target in ("csv", "tsv", "json"):
+        return "data"
+    return "office"
+
+
+def _patterns(exts):
+    pats = " ".join(f"*.{e}" for e in exts)
+    if os.name != "nt":   # Linux file names are case-sensitive: also match VIDEO.MP4
+        pats += " " + pats.upper()
+    return pats
+
+
+FILE_TYPES = [
+    ("All supported", _patterns(KIND_OF)),
+    ("Audio & video", _patterns(KINDS["video"][0].split() + KINDS["audio"][0].split())),
+    ("Images", _patterns(KINDS["image"][0].split())),
+    ("PDF", _patterns(["pdf"])),
+    ("Documents & slides", _patterns(KINDS["document"][0].split() + KINDS["slides"][0].split())),
+    ("Spreadsheets & data", _patterns(KINDS["spreadsheet"][0].split() + KINDS["data"][0].split())),
+    ("Subtitles", _patterns(KINDS["subtitles"][0].split())),
+    ("Archives", _patterns(KINDS["archive"][0].split())),
+    ("All files", "*.*"),
+]
+
+# Python packages each converter needs (import name -> pip name)
+PACKAGES = {"image": {"PIL": "pillow"}, "pdf": {"PIL": "pillow", "pypdfium2": "pypdfium2"}}
 
 # ----------------------------------------------------------------- ffmpeg ---
 
 
-WINGET_CMD = "winget install -e --id Gyan.FFmpeg"
+_LO = "libreoffice-writer libreoffice-calc libreoffice-impress"
 
-# Linux package managers -> command that installs FFmpeg
-LINUX_INSTALL = [
-    ("apt-get", "sudo apt install -y ffmpeg"),
-    ("dnf", "sudo dnf install -y ffmpeg-free"),
-    ("pacman", "sudo pacman -S --needed ffmpeg"),
-    ("zypper", "sudo zypper install -y ffmpeg"),
-    ("xbps-install", "sudo xbps-install -S ffmpeg"),
-    ("apk", "sudo apk add ffmpeg"),
-    ("eopkg", "sudo eopkg install ffmpeg"),
-]
+# Outside programs AnyConverter can install for the user.
+# linux: package manager -> command that installs the program
+TOOLS = {
+    "ffmpeg": {
+        "name": "FFmpeg", "purpose": "converting audio, video and subtitles",
+        "winget": "winget install -e --id Gyan.FFmpeg",
+        "url": "https://ffmpeg.org/download.html",
+        "linux": [
+            ("apt-get", "sudo apt install -y ffmpeg"),
+            ("dnf", "sudo dnf install -y ffmpeg-free"),
+            ("pacman", "sudo pacman -S --needed ffmpeg"),
+            ("zypper", "sudo zypper install -y ffmpeg"),
+            ("xbps-install", "sudo xbps-install -S ffmpeg"),
+            ("apk", "sudo apk add ffmpeg"),
+            ("eopkg", "sudo eopkg install ffmpeg"),
+        ],
+    },
+    "office": {
+        "name": "LibreOffice", "purpose": "converting documents, slides and spreadsheets",
+        "winget": "winget install -e --id TheDocumentFoundation.LibreOffice",
+        "url": "https://www.libreoffice.org/download/download/",
+        "linux": [
+            ("apt-get", f"sudo apt install -y {_LO}"),
+            ("dnf", f"sudo dnf install -y {_LO}"),
+            ("pacman", "sudo pacman -S --needed libreoffice-fresh"),
+            ("zypper", f"sudo zypper install -y {_LO}"),
+            ("xbps-install", "sudo xbps-install -S libreoffice"),
+            ("apk", "sudo apk add libreoffice"),
+            ("eopkg", "sudo eopkg install libreoffice"),
+        ],
+    },
+}
 
 # terminal emulator -> args placed before the command to run in it
 LINUX_TERMINALS = [
@@ -177,12 +298,12 @@ LINUX_TERMINALS = [
 ]
 
 
-def install_command():
-    """The one-line command that installs FFmpeg on this system, or None."""
+def install_command(tool):
+    """The one-line command that installs this tool on this system, or None."""
     if IS_WIN:
-        return WINGET_CMD if shutil.which("winget", path=_fresh_path()) else None
-    for tool, cmd in LINUX_INSTALL:
-        if shutil.which(tool):
+        return TOOLS[tool]["winget"] if shutil.which("winget", path=_fresh_path()) else None
+    for manager, cmd in TOOLS[tool]["linux"]:
+        if shutil.which(manager):
             return cmd
     return None
 
@@ -248,8 +369,25 @@ def detect_ffmpeg():
     return FFMPEG is not None
 
 
-FFMPEG = FFPROBE = None
+def detect_office():
+    """LibreOffice's command-line converter (soffice.com on Windows waits for the result)."""
+    global SOFFICE
+    SOFFICE = None
+    if IS_WIN:
+        for var in ("ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"):
+            for exe in ("soffice.com", "soffice.exe"):
+                cand = os.path.join(os.environ.get(var, ""), "LibreOffice", "program", exe)
+                if os.environ.get(var) and os.path.isfile(cand):
+                    SOFFICE = cand
+                    return True
+    SOFFICE = find_tool("soffice") or find_tool("libreoffice")
+    return SOFFICE is not None
+
+
+DETECT = {"ffmpeg": detect_ffmpeg, "office": detect_office}
+FFMPEG = FFPROBE = SOFFICE = None
 detect_ffmpeg()
+detect_office()
 NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 
 
@@ -299,6 +437,192 @@ def probe_info(path):
     return info
 
 
+# ------------------------------------------------------ other converters ---
+
+IMAGE_QUALITY = {"High": 95, "Medium": 85, "Small": 70}
+PDF_DPI = {"High": 300, "Medium": 150, "Small": 96}       # PDF pages -> images
+PIL_FORMAT = {"png": "PNG", "jpg": "JPEG", "webp": "WEBP", "avif": "AVIF", "gif": "GIF",
+              "bmp": "BMP", "tiff": "TIFF", "ico": "ICO", "pdf": "PDF"}
+PDFIUM_LOCK = threading.Lock()
+OFFICE_LOCK = threading.Lock()
+OFFICE_PROFILE = os.path.join(tempfile.gettempdir(), "anyconverter-libreoffice")
+OFFICE_FILTERS = {"txt": "txt:Text (encoded):UTF8",
+                  "csv": "csv:Text - txt - csv (StarCalc):44,34,76,1"}   # comma, UTF-8
+
+
+def _path_uri(path):
+    import pathlib
+    return pathlib.Path(os.path.abspath(path)).as_uri()
+
+
+_heif_done = False
+
+
+def _heif():
+    """Let Pillow open iPhone photos (.heic), if pillow-heif is installed."""
+    global _heif_done
+    if not _heif_done:
+        _heif_done = True
+        try:
+            import pillow_heif
+            pillow_heif.register_heif_opener()
+        except ImportError:
+            pass
+
+
+def _flatten(img):
+    """RGB on a white background, for formats without transparency."""
+    from PIL import Image
+    if img.mode in ("RGBA", "LA", "PA") or (img.mode == "P" and "transparency" in img.info):
+        img = img.convert("RGBA")
+        bg = Image.new("RGB", img.size, "white")
+        bg.paste(img, mask=img.getchannel("A"))
+        return bg
+    return img if img.mode == "RGB" else img.convert("RGB")
+
+
+def _has_alpha(img):
+    return img.mode in ("RGBA", "LA", "PA") or "transparency" in img.info
+
+
+def save_image(img, dst, ext, quality):
+    """Save one Pillow image as ext. dst is a path or a file object."""
+    q = IMAGE_QUALITY[quality]
+    kw = {}
+    if ext in ("jpg", "pdf", "bmp"):
+        img = _flatten(img)
+    elif img.mode not in ("RGB", "RGBA", "L", "LA", "P", "1") or ext in ("webp", "avif", "ico"):
+        img = img.convert("RGBA" if _has_alpha(img) else "RGB")
+    if ext in ("jpg", "webp", "avif"):
+        kw["quality"] = q
+        exif = img.getexif()
+        if exif:
+            kw["exif"] = exif
+    if ext == "jpg":
+        kw.update(optimize=True, progressive=True)
+    elif ext == "webp":
+        kw["method"] = 4
+    elif ext == "avif":
+        from PIL import features
+        if not features.check("avif"):
+            raise RuntimeError("This copy of Pillow can't write AVIF. Update it: pip install -U pillow")
+        kw["speed"] = 6
+    elif ext == "tiff":
+        kw["compression"] = "tiff_lzw"
+    elif ext == "ico":
+        kw["sizes"] = [(s, s) for s in (16, 24, 32, 48, 64, 128, 256) if s <= max(img.size)] \
+            or [(16, 16)]
+    elif ext == "pdf":
+        # page about 11 inches on the long side, like a printed page
+        kw.update(resolution=max(72.0, max(img.size) / 11), quality=q)
+    if "icc_profile" in img.info and ext in ("jpg", "png", "webp", "tiff", "avif"):
+        kw["icc_profile"] = img.info["icc_profile"]
+    img.save(dst, PIL_FORMAT[ext], **kw)
+
+
+_NUMBER = re.compile(r"-?(0|[1-9]\d{0,14})(\.\d+)?")
+
+
+def _typed(v):
+    """'42' -> 42 and '1.5' -> 1.5 (but not '007' or phone numbers), other values as-is."""
+    if isinstance(v, str) and _NUMBER.fullmatch(v.strip()):
+        v = v.strip()
+        return float(v) if "." in v else int(v)
+    return v
+
+
+def _text(v):
+    if v is None:
+        return ""
+    if hasattr(v, "isoformat"):
+        return v.isoformat()
+    if isinstance(v, (dict, list)):
+        return json.dumps(v, ensure_ascii=False)
+    return v
+
+
+def read_table(src):
+    """A table as a list of rows; row 0 is the header."""
+    ext = split_ext(src)[1]
+    if ext == "xlsx":
+        import openpyxl
+        wb = openpyxl.load_workbook(src, read_only=True, data_only=True)
+        try:
+            rows = [list(r) for r in wb.active.iter_rows(values_only=True)]
+        finally:
+            wb.close()
+        for r in rows:
+            while r and r[-1] is None:
+                r.pop()
+        while rows and not rows[-1]:
+            rows.pop()
+        width = max((len(r) for r in rows), default=0)
+        return [r + [None] * (width - len(r)) for r in rows]
+    raw = open(src, "rb").read()
+    for enc in ("utf-8-sig", "cp1252", "latin-1"):
+        try:
+            text = raw.decode(enc)
+            break
+        except UnicodeDecodeError:
+            pass
+    if ext == "json":
+        data = json.loads(text)
+        if isinstance(data, dict):      # {"items": [...]} -> the list inside
+            lists = [v for v in data.values() if isinstance(v, list)]
+            data = lists[0] if len(data) == 1 and lists else [data]
+        if not isinstance(data, list):
+            data = [data]
+        if data and all(isinstance(d, dict) for d in data):
+            header = list(dict.fromkeys(k for d in data for k in d))
+            return [header] + [[_text(d.get(k)) for k in header] for d in data]
+        if data and all(isinstance(d, list) for d in data):
+            return [[_text(v) for v in r] for r in data]
+        return [["value"]] + [[_text(v)] for v in data]
+    if ext == "tsv":
+        delim = "\t"
+    else:
+        try:
+            delim = csv.Sniffer().sniff(text[:20000], delimiters=",;\t|").delimiter
+        except csv.Error:
+            delim = ","
+    return [r for r in csv.reader(io.StringIO(text), delimiter=delim)]
+
+
+def write_table(rows, dst, ext):
+    if ext in ("csv", "tsv"):
+        # utf-8-sig so Excel shows accents and umlauts correctly
+        with open(dst, "w", encoding="utf-8-sig" if ext == "csv" else "utf-8", newline="") as f:
+            w = csv.writer(f, delimiter="," if ext == "csv" else "\t")
+            w.writerows([[_text(v) for v in r] for r in rows])
+    elif ext == "json":
+        header = [str(h) if h not in (None, "") else f"column {i + 1}"
+                  for i, h in enumerate(rows[0] if rows else [])]
+        records = [{h: (v.isoformat() if hasattr(v, "isoformat") else _typed(v))
+                    for h, v in zip(header, r)} for r in rows[1:]]
+        with open(dst, "w", encoding="utf-8") as f:
+            json.dump(records, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+    elif ext == "xlsx":
+        import openpyxl
+        from openpyxl.cell import WriteOnlyCell
+        from openpyxl.styles import Font
+        wb = openpyxl.Workbook(write_only=True)
+        ws = wb.create_sheet("Sheet1")
+        for k, r in enumerate(rows):
+            if k == 0:
+                cells = []
+                for v in r:
+                    c = WriteOnlyCell(ws, value=_text(v))
+                    c.font = Font(bold=True)
+                    cells.append(c)
+                ws.append(cells)
+            else:
+                ws.append([_typed(v) for v in r])
+        wb.save(dst)
+    else:
+        raise ValueError(ext)
+
+
 # --------------------------------------------------------------------- UI ---
 
 BG = "#0f1117"
@@ -337,18 +661,21 @@ class Button(tk.Label):
             self.config(text=text)
 
 
-class FFmpegDialog(tk.Toplevel):
-    """Friendly 'FFmpeg is missing' guide with one-click install
+class ToolDialog(tk.Toplevel):
+    """Friendly 'FFmpeg / LibreOffice is missing' guide with one-click install
     (winget on Windows, the distro's package manager on Linux)."""
 
-    def __init__(self, master, on_found):
+    def __init__(self, master, tool, on_found):
         super().__init__(master)
+        self.tool = tool
         self.on_found = on_found
-        self.title("FFmpeg needed")
+        spec = TOOLS[tool]
+        name = spec["name"]
+        self.title(f"{name} needed")
         self.configure(bg=BG)
         self.resizable(False, False)
         self.transient(master)
-        self.cmd = install_command()
+        self.cmd = install_command(tool)
 
         body = tk.Frame(self, bg=BG)
         body.pack(fill="both", expand=True, padx=26, pady=22)
@@ -356,8 +683,8 @@ class FFmpegDialog(tk.Toplevel):
         tk.Label(body, text="One quick step before you start", bg=BG, fg=FG,
                  font=(FONT, 15, "bold")).pack(anchor="w")
         tk.Label(body, bg=BG, fg=MUTED, font=(FONT, 10), justify="left", wraplength=470,
-                 text="AnyConverter uses a free program called FFmpeg to do the actual "
-                      "converting. It isn't installed on this computer yet. It only takes a minute:"
+                 text=f"AnyConverter uses a free program called {name} for {spec['purpose']}. "
+                      f"It isn't installed on this computer yet. It only takes a few minutes:"
                  ).pack(anchor="w", pady=(6, 16))
 
         def step(num, title, text):
@@ -372,36 +699,41 @@ class FFmpegDialog(tk.Toplevel):
                      wraplength=430).pack(anchor="w")
             return col
 
+        ready = f"AnyConverter will find {name} and you're ready to go."
         if self.cmd and IS_WIN:
-            col = step(1, "Install FFmpeg",
-                       "Click “Install for me”. A black window will open and install FFmpeg. "
+            col = step(1, f"Install {name}",
+                       f"Click “Install for me”. A black window will open and install {name}. "
                        "If it asks you to agree to terms, type Y and press Enter.\n"
                        "Or, if you prefer, copy this command into PowerShell yourself:")
             self._cmd_box(col)
             step(2, "Wait until it says “Successfully installed”",
                  "Then close that black window.")
-            step(3, "Click “Check again” below", "AnyConverter will find FFmpeg and you're ready to go.")
+            step(3, "Click “Check again” below", ready)
         elif self.cmd:
-            col = step(1, "Install FFmpeg",
+            col = step(1, f"Install {name}",
                        "Click “Install for me”. A terminal window will open. Type your "
                        "password when asked (nothing shows while you type, that's normal) "
                        "and press Enter.\n"
                        "Or, if you prefer, copy this command into a terminal yourself:")
             self._cmd_box(col)
             step(2, "Wait until it finishes", "Then press Enter to close the terminal.")
-            step(3, "Click “Check again” below", "AnyConverter will find FFmpeg and you're ready to go.")
+            step(3, "Click “Check again” below", ready)
         elif not IS_WIN:
-            step(1, "Install the “ffmpeg” package",
+            step(1, f"Install the “{name.lower()}” package",
                  "Open your distribution's software center (or package manager), "
-                 "search for “ffmpeg” and install it.")
-            step(2, "Click “Check again” below", "AnyConverter will find FFmpeg and you're ready to go.")
-        else:
+                 f"search for “{name.lower()}” and install it.")
+            step(2, "Click “Check again” below", ready)
+        elif tool == "ffmpeg":
             step(1, "Download FFmpeg",
                  "Go to ffmpeg.org/download.html, download a Windows build and unzip it.")
             step(2, "Copy two files next to AnyConverter",
                  "From its “bin” folder, copy ffmpeg.exe and ffprobe.exe into the same "
                  "folder as AnyConverter.")
-            step(3, "Click “Check again” below", "AnyConverter will find FFmpeg and you're ready to go.")
+            step(3, "Click “Check again” below", ready)
+        else:
+            step(1, f"Download and install {name}",
+                 "Click “Open download page”, download the Windows installer and run it.")
+            step(2, "Click “Check again” below", ready)
 
         self.msg = tk.Label(body, text="", bg=BG, fg=ERR, font=(FONT, 9))
         self.msg.pack(anchor="w", pady=(2, 10))
@@ -413,7 +745,7 @@ class FFmpegDialog(tk.Toplevel):
             Button(btns, "Install for me", self.install).pack(side="right", padx=8)
         elif IS_WIN:
             Button(btns, "Open download page", lambda: __import__("webbrowser").open(
-                "https://ffmpeg.org/download.html")).pack(side="right", padx=8)
+                TOOLS[tool]["url"])).pack(side="right", padx=8)
         Button(btns, "Later", self.destroy).pack(side="left")
 
         self.update_idletasks()
@@ -449,7 +781,7 @@ class FFmpegDialog(tk.Toplevel):
             self.msg.config(text=f"Couldn't start the installer: {e}", fg=ERR)
 
     def recheck(self):
-        if detect_ffmpeg():
+        if DETECT[self.tool]():
             self.destroy()
             self.on_found()
         else:
@@ -461,8 +793,8 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("AnyConverter")
-        self.geometry("820x640")
-        self.minsize(700, 520)
+        self.geometry("820x690")
+        self.minsize(700, 560)
         self.configure(bg=BG)
         try:
             from ctypes import windll
@@ -473,13 +805,14 @@ class App(tk.Tk):
         self.files = []          # list of paths
         self.msgs = queue.Queue()
         self.worker = None
-        self.procs = set()       # running ffmpeg processes (several in parallel modes)
+        self.procs = set()       # running ffmpeg / LibreOffice processes
         self.lock = threading.Lock()
         self.cancelled = False
 
         self.fmt = tk.StringVar(value="mp4")
         self.quality = tk.StringVar(value="Medium")
         self.outdir = tk.StringVar(value="")  # "" = same folder as source
+        self.merge = tk.BooleanVar(value=False)
 
         self._style()
         self._build()
@@ -487,8 +820,9 @@ class App(tk.Tk):
         self.after(100, self._poll)
 
         if not FFMPEG:
-            self.status.config(text="FFmpeg is not installed. Click Convert for help", fg=ERR)
-            self.after(300, self.show_ffmpeg_help)
+            self.status.config(text="FFmpeg is not installed (needed for audio & video). "
+                                    "Click Convert for help", fg=ERR)
+            self.after(300, lambda: self.show_tool_help("ffmpeg"))
 
     def _apply_args(self, args):
         """AnyConverter [--format EXT] [FILE ...]: preselect the target format and add files
@@ -505,9 +839,9 @@ class App(tk.Tk):
                 paths.append(a)
         self.add_paths(paths)
 
-    def show_ffmpeg_help(self):
-        FFmpegDialog(self, on_found=lambda: self.status.config(
-            text="FFmpeg found, you're all set!", fg=OK))
+    def show_tool_help(self, tool):
+        ToolDialog(self, tool, on_found=lambda: self.status.config(
+            text=f"{TOOLS[tool]['name']} found, you're all set!", fg=OK))
 
     # ---- styling
     def _style(self):
@@ -547,7 +881,7 @@ class App(tk.Tk):
         head.pack(fill="x", pady=(20, 12), **pad)
         tk.Label(head, text="AnyConverter", bg=BG, fg=FG,
                  font=(FONT, 22, "bold")).pack(side="left")
-        tk.Label(head, text="  audio & video, any format", bg=BG, fg=MUTED,
+        tk.Label(head, text="  audio, video, images, PDFs, documents & more", bg=BG, fg=MUTED,
                  font=(FONT, 11)).pack(side="left", pady=(8, 0))
 
         # file list card
@@ -571,16 +905,17 @@ class App(tk.Tk):
         self.tree.heading("name", text="NAME", anchor="w")
         self.tree.heading("status", text="STATUS", anchor="w")
         self.tree.column("name", anchor="w", stretch=True)
-        self.tree.column("status", width=170, anchor="w", stretch=False)
+        self.tree.column("status", width=210, anchor="w", stretch=False)
         self.tree.tag_configure("ok", foreground=OK)
         self.tree.tag_configure("err", foreground=ERR)
         self.tree.tag_configure("run", foreground=ACCENT_HOVER)
+        self.tree.tag_configure("skip", foreground=MUTED)
         sb = ttk.Scrollbar(tree_wrap, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=sb.set)
         self.tree.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
 
-        self.empty_lbl = tk.Label(self.tree, text="Click  “+ Add files”  to choose audio or video files",
+        self.empty_lbl = tk.Label(self.tree, text="Click  “+ Add files”  to choose files to convert",
                                   bg=CARD, fg=MUTED, font=(FONT, 11), cursor="hand2")
         self.empty_lbl.bind("<Button-1>", lambda e: self.add_files())
         self.empty_lbl.place(relx=0.5, rely=0.5, anchor="center")
@@ -596,12 +931,15 @@ class App(tk.Tk):
         self._label(inner, "QUALITY", 9, bold=True).grid(row=0, column=1, sticky="w", padx=(16, 0))
         self._label(inner, "SAVE TO", 9, bold=True).grid(row=0, column=2, sticky="w", padx=(16, 0))
 
-        values = ([f"{f}   ·  video" for f in VIDEO_FORMATS]
-                  + [f"{f}   ·  audio" for f in AUDIO_FORMATS])
-        self.fmt_box = ttk.Combobox(inner, values=values, state="readonly", width=16,
-                                    font=(FONT, 10))
-        self.fmt_box.set(values[0])
+        self.fmt_box = ttk.Combobox(inner, state="readonly", width=20, font=(FONT, 10),
+                                    height=20)
         self.fmt_box.grid(row=1, column=0, sticky="w", pady=(6, 0))
+        self.fmt_box.bind("<<ComboboxSelected>>", lambda e: self._refresh_merge())
+        self.merge_chk = tk.Checkbutton(
+            inner, text="Combine all files into one PDF", variable=self.merge,
+            bg=CARD, fg=FG, selectcolor=CARD2, activebackground=CARD, activeforeground=FG,
+            font=(FONT, 10), bd=0, highlightthickness=0, cursor="hand2")
+        self.merge_chk.grid(row=2, column=0, columnspan=3, sticky="w", pady=(10, 0))
 
         q = ttk.Combobox(inner, textvariable=self.quality, values=list(QUALITY),
                          state="readonly", width=10, font=(FONT, 10))
@@ -634,9 +972,8 @@ class App(tk.Tk):
     def add_files(self):
         if self.worker:
             return
-        paths = filedialog.askopenfilenames(
-            title="Choose audio / video files",
-            filetypes=[("Audio & video", MEDIA_EXTS), ("All files", "*.*")])
+        paths = filedialog.askopenfilenames(title="Choose files to convert",
+                                            filetypes=FILE_TYPES)
         self.add_paths(paths)
 
     def add_paths(self, paths):
@@ -671,6 +1008,30 @@ class App(tk.Tk):
             self.empty_lbl.place_forget()
         else:
             self.empty_lbl.place(relx=0.5, rely=0.5, anchor="center")
+        self._refresh_formats()
+
+    def _refresh_formats(self):
+        """Offer every format at least one of the files can become (all when empty)."""
+        wanted = set()
+        for p in self.files:
+            wanted.update(outputs_for(p))
+        seen, values = set(), []
+        for label, fmts in FORMAT_GROUPS:
+            for f in fmts:
+                if f not in seen and (not self.files or f in wanted):
+                    seen.add(f)
+                    values.append(f"{f}   ·  {label}")
+        current = self.fmt_box.get()
+        self.fmt_box["values"] = values
+        if current not in values:
+            self.fmt_box.set(values[0] if values else "")
+        self._refresh_merge()
+
+    def _refresh_merge(self):
+        if self.fmt_box.get().split()[:1] == ["pdf"] and len(self.files) > 1:
+            self.merge_chk.grid()
+        else:
+            self.merge_chk.grid_remove()
 
     def pick_outdir(self):
         d = filedialog.askdirectory(title="Choose output folder")
@@ -688,14 +1049,32 @@ class App(tk.Tk):
             self.cancelled = True
             self._kill_all()
             return
-        if not FFMPEG and not detect_ffmpeg():
-            self.show_ffmpeg_help()
-            return
         if not self.files:
             messagebox.showinfo("No files", "Add some files first.")
             return
         ext = self.fmt_box.get().split()[0]
         jobs = list(self.files)
+        merge = ext == "pdf" and self.merge.get() and len(jobs) > 1
+        engines = {"pdf"} if merge else {engine_for(p, ext) for p in jobs} - {None}
+        for tool, found in (("ffmpeg", FFMPEG), ("office", SOFFICE)):
+            if tool in engines and not found and not DETECT[tool]():
+                self.show_tool_help(tool)
+                return
+        need = {}
+        for e in engines:
+            need.update(PACKAGES.get(e, {}))
+        if any(split_ext(p)[1] in ("heic", "heif") for p in jobs):
+            need["pillow_heif"] = "pillow-heif"
+        if "data" in engines and (ext == "xlsx" or any(split_ext(p)[1] == "xlsx" for p in jobs)):
+            need["openpyxl"] = "openpyxl"
+        missing = [pip for mod, pip in need.items() if importlib.util.find_spec(mod) is None]
+        if missing:
+            messagebox.showerror(
+                "Missing Python packages",
+                "This conversion needs a few extra Python packages. Install them with:\n\n"
+                f"    pip install {' '.join(missing)}\n\n"
+                "(The ready-made AnyConverter app already includes them.)")
+            return
         for p in jobs:
             self.tree.item(p, values=(os.path.basename(p), "Waiting"), tags=())
         self.cancelled = False
@@ -703,7 +1082,7 @@ class App(tk.Tk):
         self.add_btn.set_enabled(False)
         self.worker = threading.Thread(
             target=self._run,
-            args=(jobs, ext, self.quality.get(), self.outdir.get()),
+            args=(jobs, ext, self.quality.get(), self.outdir.get(), merge),
             daemon=True)
         self.worker.start()
 
@@ -714,12 +1093,19 @@ class App(tk.Tk):
             if p.poll() is None:
                 p.terminate()
 
-    def _run(self, jobs, ext, quality, outdir):
+    def _run(self, jobs, ext, quality, outdir, merge=False):
         self.job_pct = dict.fromkeys(jobs, 0.0)
         self.reserved = set()
+        if merge:
+            ok = self._merge_pdf(jobs, quality, outdir)
+            self.msgs.put(("finished", int(ok), int(not ok), self.cancelled, 0))
+            return
         # Video encoders already use every core, so videos go one at a time.
-        # Audio encoders use one core each, so several audio files run at once.
-        workers = 1 if ext in VIDEO_FORMATS else max(1, min(len(jobs), (os.cpu_count() or 2) // 2, 8))
+        # Audio encoders and the other converters use one core each, so
+        # several files run at once.
+        video = (ext in VIDEO_FORMATS or ext == "gif") and \
+            any(engine_for(p, ext) == "ffmpeg" for p in jobs)
+        workers = 1 if video else max(1, min(len(jobs), (os.cpu_count() or 2) // 2, 8))
         if workers > 1:
             self.msgs.put(("status", f"Converting {len(jobs)} files to {ext.upper()} "
                                      f"({workers} at a time)…"))
@@ -727,7 +1113,8 @@ class App(tk.Tk):
             results = list(pool.map(
                 lambda ij: self._convert_one(*ij, len(jobs), ext, quality, outdir, workers == 1),
                 enumerate(jobs)))
-        self.msgs.put(("finished", results.count("ok"), results.count("fail"), self.cancelled))
+        self.msgs.put(("finished", results.count("ok"), results.count("fail"), self.cancelled,
+                       results.count("skip")))
 
     def _set_pct(self, src, pct):
         self.job_pct[src] = pct
@@ -735,28 +1122,67 @@ class App(tk.Tk):
         self.msgs.put(("row", src, f"Converting… {pct:4.0f}%", "run"))
 
     def _target_path(self, src, ext, outdir):
-        name = os.path.splitext(os.path.basename(src))[0]
+        name = split_ext(src)[0]
         folder = outdir or os.path.dirname(src)
         dst = os.path.join(folder, f"{name}.{ext}")
         if os.path.normcase(os.path.abspath(dst)) == os.path.normcase(os.path.abspath(src)):
             dst = os.path.join(folder, f"{name} (converted).{ext}")
+        return self._unique(dst, ext)
+
+    def _unique(self, path, ext=""):
+        """path, or "name (1).ext" etc. if that is taken (ext="" for folders)."""
         with self.lock:   # parallel jobs must not pick the same output name
-            root, e = os.path.splitext(dst)
+            root = path[:-len(ext) - 1] if ext else path
+            tail = f".{ext}" if ext else ""
             i = 0
-            while os.path.exists(dst) or dst in self.reserved:
+            while os.path.exists(path) or path in self.reserved:
                 i += 1
-                dst = f"{root} ({i}){e}"
-            self.reserved.add(dst)
-        return dst
+                path = f"{root} ({i}){tail}"
+            self.reserved.add(path)
+        return path
 
     def _convert_one(self, i, src, total, ext, quality, outdir, show_status):
         if self.cancelled:
             self.msgs.put(("row", src, "Cancelled", "err"))
             return "cancel"
+        engine = engine_for(src, ext)
+        if engine is None or SAME.get(split_ext(src)[1], split_ext(src)[1]) == ext:
+            why = "Already " + ext.upper() if engine else "Can't make " + ext.upper()
+            self.msgs.put(("row", src, f"Skipped · {why}", "skip"))
+            self.job_pct[src] = 100.0
+            return "skip"
         dst = self._target_path(src, ext, outdir)
         self.msgs.put(("row", src, "Starting…", "run"))
         if show_status:
             self.msgs.put(("status", f"[{i + 1}/{total}]  {os.path.basename(src)}  →  {ext.upper()}"))
+        if engine == "ffmpeg":
+            code, err = self._convert_media(src, dst, ext, quality)
+        else:
+            try:
+                getattr(self, "_conv_" + engine)(src, dst, ext, quality)
+                code, err = (1, "Cancelled") if self.cancelled else (0, "")
+            except Exception as e:
+                code, err = 1, str(e) or type(e).__name__
+
+        if self.cancelled:
+            self._remove(dst)
+            self.msgs.put(("row", src, "Cancelled", "err"))
+            result = "cancel"
+        elif code == 0:
+            self.msgs.put(("row", src, "✓ Done", "ok"))
+            result = "ok"
+        else:
+            self._remove(dst)
+            self.msgs.put(("row", src, "✗ Failed", "err"))
+            self.msgs.put(("log", os.path.basename(src), err))
+            result = "fail"
+        self.job_pct[src] = 100.0
+        self.msgs.put(("progress", sum(self.job_pct.values()) / len(self.job_pct)))
+        return result
+
+    def _convert_media(self, src, dst, ext, quality):
+        if KIND_OF.get(split_ext(src)[1]) == "subtitles":
+            return self._ffmpeg_one(src, dst, [], None)
         info = probe_info(src)
         # Fastest first; if FFmpeg rejects an attempt (a stream that can't be
         # copied after all), fall back to re-encoding audio, then everything.
@@ -775,22 +1201,185 @@ class App(tk.Tk):
                 code, err = self._ffmpeg_one(src, dst, args, info["duration"])
             if code == 0 or self.cancelled:
                 break
+        return code, err
 
-        if self.cancelled:
+    # ---- images (Pillow)
+    def _conv_image(self, src, dst, ext, quality):
+        from PIL import Image, ImageOps
+        _heif()
+        self._set_pct(src, 10)
+        with Image.open(src) as im:
+            if getattr(im, "n_frames", 1) > 1 and ext in ("gif", "webp", "tiff"):
+                # animation stays an animation (Pillow converts every frame)
+                kw = {"save_all": True, "loop": im.info.get("loop", 0)}
+                if ext == "webp":
+                    kw["quality"] = IMAGE_QUALITY[quality]
+                elif ext == "tiff":
+                    kw = {"save_all": True, "compression": "tiff_lzw"}
+                im.save(dst, PIL_FORMAT[ext], **kw)
+                return
+            img = ImageOps.exif_transpose(im)    # phone photos: apply the rotation
+            save_image(img, dst, ext, quality)
+
+    # ---- PDF (pdfium)
+    def _conv_pdf(self, src, dst, ext, quality):
+        import pypdfium2 as pdfium
+        with PDFIUM_LOCK:     # pdfium isn't thread-safe
+            pdf = pdfium.PdfDocument(src)
+            try:
+                n = len(pdf)
+                if ext == "txt":
+                    parts = []
+                    for k in range(n):
+                        page = pdf[k]
+                        text = page.get_textpage()
+                        parts.append(text.get_text_bounded())
+                        text.close()
+                        page.close()
+                        self._set_pct(src, (k + 1) / n * 95)
+                    with open(dst, "w", encoding="utf-8", newline="\n") as f:
+                        f.write("\n\n".join(p.replace("\r\n", "\n").strip() for p in parts) + "\n")
+                    return
+                # one image per page; several pages go into their own folder
+                if n > 1:
+                    folder = self._unique(dst[:-len(ext) - 1])
+                    os.makedirs(folder)
+                    outs = [os.path.join(folder, f"page {k + 1:0{len(str(n))}d}.{ext}")
+                            for k in range(n)]
+                else:
+                    folder, outs = None, [dst]
+                try:
+                    for k in range(n):
+                        if self.cancelled:
+                            raise RuntimeError("Cancelled")
+                        page = pdf[k]
+                        img = page.render(scale=PDF_DPI[quality] / 72).to_pil()
+                        page.close()
+                        save_image(img, outs[k], ext, quality)
+                        self._set_pct(src, (k + 1) / n * 100)
+                except BaseException:
+                    if folder:
+                        shutil.rmtree(folder, ignore_errors=True)
+                    raise
+            finally:
+                pdf.close()
+
+    def _merge_pdf(self, jobs, quality, outdir):
+        """All PDFs and images, in list order, into one "Combined.pdf"."""
+        import pypdfium2 as pdfium
+        from PIL import Image, ImageOps
+        _heif()
+        usable = [p for p in jobs if KIND_OF.get(split_ext(p)[1]) in ("pdf", "image")]
+        for p in jobs:
+            if p not in usable:
+                self.msgs.put(("row", p, "Skipped · not a PDF or image", "skip"))
+        if not usable:
+            self._last_error = ("", "None of the files is a PDF or an image.")
+            return False
+        dst = self._unique(os.path.join(outdir or os.path.dirname(usable[0]), "Combined.pdf"),
+                           "pdf")
+        self.msgs.put(("status", f"Combining {len(usable)} files into {os.path.basename(dst)}…"))
+        try:
+            with PDFIUM_LOCK:
+                out = pdfium.PdfDocument.new()
+                opened = []
+                for k, p in enumerate(usable):
+                    if self.cancelled:
+                        raise RuntimeError("Cancelled")
+                    self.msgs.put(("row", p, "Adding…", "run"))
+                    if split_ext(p)[1] == "pdf":
+                        part = pdfium.PdfDocument(p)
+                    else:
+                        buf = io.BytesIO()
+                        with Image.open(p) as im:
+                            save_image(ImageOps.exif_transpose(im), buf, "pdf", quality)
+                        part = pdfium.PdfDocument(buf.getvalue())
+                    opened.append(part)
+                    out.import_pages(part)
+                    self.msgs.put(("row", p, "✓ Added", "ok"))
+                    self.msgs.put(("progress", (k + 1) / len(usable) * 95))
+                out.save(dst)
+                for part in opened:
+                    part.close()
+                out.close()
+        except Exception as e:
             self._remove(dst)
-            self.msgs.put(("row", src, "Cancelled", "err"))
-            result = "cancel"
-        elif code == 0:
-            self.msgs.put(("row", src, "✓ Done", "ok"))
-            result = "ok"
-        else:
-            self._remove(dst)
-            self.msgs.put(("row", src, "✗ Failed", "err"))
-            self.msgs.put(("log", os.path.basename(src), err))
-            result = "fail"
-        self.job_pct[src] = 100.0
-        self.msgs.put(("progress", sum(self.job_pct.values()) / len(self.job_pct)))
-        return result
+            self._last_error = (os.path.basename(dst), str(e))
+            for p in usable:
+                self.msgs.put(("row", p, "Cancelled" if self.cancelled else "✗ Failed", "err"))
+            return False
+        self.msgs.put(("progress", 100))
+        return True
+
+    # ---- spreadsheets & data (csv / tsv / json / xlsx)
+    def _conv_data(self, src, dst, ext, quality):
+        self._set_pct(src, 10)
+        rows = read_table(src)
+        self._set_pct(src, 50)
+        write_table(rows, dst, ext)
+
+    # ---- documents, slides, spreadsheets (LibreOffice)
+    def _conv_office(self, src, dst, ext, quality):
+        self._set_pct(src, 5)
+        with OFFICE_LOCK:     # one LibreOffice at a time: they share a profile
+            tmp = tempfile.mkdtemp(prefix="anyconv-")
+            try:
+                cmd = [SOFFICE, "-env:UserInstallation=" + _path_uri(OFFICE_PROFILE),
+                       "--headless", "--norestore", "--nolockcheck"]
+                if split_ext(src)[1] in ("html", "htm"):
+                    cmd.append("--infilter=HTML (StarWriter)")   # as a document, not a web page
+                cmd += ["--convert-to", OFFICE_FILTERS.get(ext, ext), "--outdir", tmp, src]
+                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                        text=True, encoding="utf-8", errors="replace",
+                                        creationflags=NO_WINDOW)
+                with self.lock:
+                    self.procs.add(proc)
+                try:
+                    self._set_pct(src, 30)
+                    out, _ = proc.communicate(timeout=600)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    raise RuntimeError("LibreOffice took longer than 10 minutes and was stopped.")
+                finally:
+                    with self.lock:
+                        self.procs.discard(proc)
+                made = [f for f in os.listdir(tmp) if os.path.isfile(os.path.join(tmp, f))]
+                if self.cancelled:
+                    return
+                if not made:
+                    raise RuntimeError("LibreOffice couldn't convert this file.\n" + out[-500:])
+                shutil.move(os.path.join(tmp, made[0]), dst)
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+
+    # ---- archives (zip / tar)
+    def _conv_archive(self, src, dst, ext, quality):
+        tmp = tempfile.mkdtemp(prefix="anyconv-")
+        try:
+            self._set_pct(src, 5)
+            if zipfile.is_zipfile(src):
+                with zipfile.ZipFile(src) as z:
+                    z.extractall(tmp)
+            else:
+                with tarfile.open(src) as t:
+                    t.extractall(tmp, filter="data")
+            self._set_pct(src, 50)
+            if self.cancelled:
+                return
+            entries = sorted(os.listdir(tmp))
+            if ext == "zip":
+                with zipfile.ZipFile(dst, "w", zipfile.ZIP_DEFLATED) as z:
+                    for root, dirs, files in os.walk(tmp):
+                        for name in sorted(dirs + files):
+                            full = os.path.join(root, name)
+                            z.write(full, os.path.relpath(full, tmp))
+            else:
+                mode = {"tar.gz": "w:gz", "tar.xz": "w:xz", "tar": "w"}[ext]
+                with tarfile.open(dst, mode) as t:
+                    for name in entries:
+                        t.add(os.path.join(tmp, name), name)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
     def _ffmpeg_one(self, src, dst, args, duration, pre_input=(), on_time=None):
         """Run one ffmpeg; report progress for src unless on_time is given.
@@ -926,11 +1515,14 @@ class App(tk.Tk):
                     print(f"--- {msg[1]} failed ---\n{msg[2]}\n", file=sys.stderr)
                     self._last_error = (msg[1], msg[2])
                 elif kind == "finished":
-                    _, done, failed, cancelled = msg
+                    _, done, failed, cancelled, skipped = msg
                     self.worker = None
                     self.go_btn.config(text="Convert")
                     self.add_btn.set_enabled(True)
-                    if cancelled:
+                    if done == 0 and skipped and not failed and not cancelled:
+                        self.status.config(text=f"Nothing to do: {skipped} file(s) can't be "
+                                                f"converted to this format", fg=ERR)
+                    elif cancelled:
                         self.status.config(text=f"Cancelled  ·  {done} converted", fg=ERR)
                     elif failed:
                         self.status.config(text=f"{done} converted, {failed} failed", fg=ERR)
@@ -939,7 +1531,9 @@ class App(tk.Tk):
                             "Some files failed",
                             f"{failed} file(s) could not be converted.\n\nLast error ({name}):\n{log[-600:]}")
                     else:
-                        self.status.config(text=f"All done  ·  {done} file(s) converted", fg=OK)
+                        extra = f", {skipped} skipped" if skipped else ""
+                        self.status.config(text=f"All done  ·  {done} file(s) converted{extra}",
+                                           fg=OK)
         except queue.Empty:
             pass
         self.after(80, self._poll)

@@ -39,12 +39,12 @@ cat > "$DESKTOP" <<EOF
 [Desktop Entry]
 Type=Application
 Name=AnyConverter
-Comment=Convert audio and video files into any format
+Comment=Convert audio, video, images, PDFs, documents and more
 Exec=$TARGET %F
 Icon=multimedia-video-player
 Terminal=false
-Categories=AudioVideo;Audio;Video;Utility;
-MimeType=video/mp4;video/x-matroska;video/webm;video/quicktime;video/x-msvideo;video/ogg;audio/mpeg;audio/x-wav;audio/flac;audio/ogg;audio/mp4;audio/aac;
+Categories=AudioVideo;Audio;Video;Graphics;Office;Utility;
+MimeType=video/mp4;video/x-matroska;video/webm;video/quicktime;video/x-msvideo;video/ogg;audio/mpeg;audio/x-wav;audio/flac;audio/ogg;audio/mp4;audio/aac;image/png;image/jpeg;image/webp;image/gif;image/bmp;image/tiff;image/heic;application/pdf;text/csv;application/json;application/vnd.openxmlformats-officedocument.wordprocessingml.document;application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;application/vnd.openxmlformats-officedocument.presentationml.presentation;application/zip;
 EOF
 
 command -v update-desktop-database >/dev/null && update-desktop-database "$APP_DIR" || true

@@ -18,7 +18,8 @@ python3 -c "import tkinter" 2>/dev/null || {
 }
 
 python3 -m venv .venv-build
-.venv-build/bin/pip install --quiet --upgrade pip pyinstaller
+.venv-build/bin/pip install --quiet --upgrade pip pyinstaller \
+    pillow pillow-heif pypdfium2 openpyxl
 .venv-build/bin/pyinstaller --noconfirm --onefile --windowed \
     --name AnyConverter anyconverter.py
 
