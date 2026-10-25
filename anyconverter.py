@@ -450,6 +450,21 @@ OFFICE_FILTERS = {"txt": "txt:Text (encoded):UTF8",
                   "csv": "csv:Text - txt - csv (StarCalc):44,34,76,1"}   # comma, UTF-8
 
 
+def kill_tree(proc):
+    """Stop a process and everything it started (soffice leaves soffice.bin
+    running otherwise, which blocks every later document conversion)."""
+    try:
+        if IS_WIN:
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                           capture_output=True, creationflags=NO_WINDOW)
+        else:
+            os.killpg(proc.pid, 15)
+    except (OSError, ProcessLookupError):
+        pass
+    if proc.poll() is None:
+        proc.terminate()
+
+
 def _path_uri(path):
     import pathlib
     return pathlib.Path(os.path.abspath(path)).as_uri()
@@ -1091,7 +1106,7 @@ class App(tk.Tk):
             procs = list(self.procs)
         for p in procs:
             if p.poll() is None:
-                p.terminate()
+                kill_tree(p)
 
     def _run(self, jobs, ext, quality, outdir, merge=False):
         self.job_pct = dict.fromkeys(jobs, 0.0)
@@ -1324,33 +1339,44 @@ class App(tk.Tk):
         with OFFICE_LOCK:     # one LibreOffice at a time: they share a profile
             tmp = tempfile.mkdtemp(prefix="anyconv-")
             try:
-                cmd = [SOFFICE, "-env:UserInstallation=" + _path_uri(OFFICE_PROFILE),
-                       "--headless", "--norestore", "--nolockcheck"]
-                if split_ext(src)[1] in ("html", "htm"):
-                    cmd.append("--infilter=HTML (StarWriter)")   # as a document, not a web page
-                cmd += ["--convert-to", OFFICE_FILTERS.get(ext, ext), "--outdir", tmp, src]
-                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                        text=True, encoding="utf-8", errors="replace",
-                                        creationflags=NO_WINDOW)
-                with self.lock:
-                    self.procs.add(proc)
-                try:
-                    self._set_pct(src, 30)
-                    out, _ = proc.communicate(timeout=600)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    raise RuntimeError("LibreOffice took longer than 10 minutes and was stopped.")
-                finally:
-                    with self.lock:
-                        self.procs.discard(proc)
-                made = [f for f in os.listdir(tmp) if os.path.isfile(os.path.join(tmp, f))]
-                if self.cancelled:
-                    return
-                if not made:
-                    raise RuntimeError("LibreOffice couldn't convert this file.\n" + out[-500:])
-                shutil.move(os.path.join(tmp, made[0]), dst)
+                doc = src
+                if ext == "txt" and split_ext(src)[1] not in ("odt", "txt"):
+                    # LibreOffice's text export can hang on some Word files
+                    # (tables); going through its own format first avoids that.
+                    doc = self._soffice(src, "odt", os.path.join(tmp, "step"))
+                    self._set_pct(src, 50)
+                made = self._soffice(doc, ext, tmp)
+                if not self.cancelled:
+                    shutil.move(made, dst)
             finally:
                 shutil.rmtree(tmp, ignore_errors=True)
+
+    def _soffice(self, src, ext, outdir):
+        """Convert src into outdir with LibreOffice; returns the new file's path."""
+        cmd = [SOFFICE, "-env:UserInstallation=" + _path_uri(OFFICE_PROFILE),
+               "--headless", "--norestore", "--nolockcheck"]
+        if split_ext(src)[1] in ("html", "htm"):
+            cmd.append("--infilter=HTML (StarWriter)")   # as a document, not a web page
+        cmd += ["--convert-to", OFFICE_FILTERS.get(ext, ext), "--outdir", outdir, src]
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, encoding="utf-8", errors="replace",
+                                creationflags=NO_WINDOW, start_new_session=not IS_WIN)
+        with self.lock:
+            self.procs.add(proc)
+        try:
+            out, _ = proc.communicate(timeout=300)
+        except subprocess.TimeoutExpired:
+            kill_tree(proc)
+            raise RuntimeError("LibreOffice took longer than 5 minutes and was stopped.")
+        finally:
+            with self.lock:
+                self.procs.discard(proc)
+        if self.cancelled:
+            raise RuntimeError("Cancelled")
+        made = os.path.join(outdir, f"{split_ext(src)[0]}.{ext}")
+        if not os.path.isfile(made):
+            raise RuntimeError("LibreOffice couldn't convert this file.\n" + out[-500:])
+        return made
 
     # ---- archives (zip / tar)
     def _conv_archive(self, src, dst, ext, quality):
