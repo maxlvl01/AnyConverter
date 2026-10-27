@@ -115,11 +115,19 @@ def audio_encoder_args(enc, q):
     }[enc]
 
 
-def build_args(ext, q, info, copy="va"):
+def scale_filter(max_size):
+    """Down to at most max_size (never up), the picture's shape kept, even sides (encoders want them)."""
+    w, h = max_size
+    return (f"scale='min({w},iw)':'min({h},ih)':force_original_aspect_ratio=decrease"
+            f":force_divisible_by=2")
+
+
+def build_args(ext, q, info, copy="va", max_size=None):
     """FFmpeg output args for one file. info = probe_info() result.
-    copy: which streams may be copied as-is ("va", "v" or "")."""
+    copy: which streams may be copied as-is ("va", "v" or "").
+    max_size: (width, height) the video may be at most (scaled down, shape kept), or None."""
     venc, aenc = TARGETS[ext]
-    vcopy = "v" in copy and q != "Small"
+    vcopy = "v" in copy and q != "Small" and max_size is None
     acopy = "a" in copy and q != "Small"
     args = ["-sn", "-dn"]
     if venc is None:
@@ -129,6 +137,8 @@ def build_args(ext, q, info, copy="va"):
         if info["vcodec"] == "hevc" and ext in ("mp4", "m4v", "mov"):
             args += ["-tag:v", "hvc1"]       # so Apple players accept it
     else:
+        if max_size:
+            args += ["-vf", scale_filter(max_size)]
         args += video_encoder_args(venc, q)
     if aenc is None:
         args += ["-an"]
@@ -828,6 +838,8 @@ class App(tk.Tk):
         self.quality = tk.StringVar(value="Medium")
         self.outdir = tk.StringVar(value="")  # "" = same folder as source
         self.merge = tk.BooleanVar(value=False)
+        # (Quiznight opens AnyConverter with --max-size 1280x720: its videos needn't be bigger)
+        self.max_size = None
 
         self._style()
         self._build()
@@ -840,12 +852,18 @@ class App(tk.Tk):
             self.after(300, lambda: self.show_tool_help("ffmpeg"))
 
     def _apply_args(self, args):
-        """AnyConverter [--format EXT] [FILE ...]: preselect the target format and add files
-        (Quiznight opens it this way with --format ogv and the video to convert)."""
+        """AnyConverter [--format EXT] [--max-size WxH] [FILE ...]: preselect the target format, limit
+        videos' size, and add files (Quiznight opens it with --format ogv --max-size 1280x720 and the video)."""
         paths = []
         it = iter(args)
         for a in it:
-            if a == "--format":
+            if a == "--max-size":
+                try:
+                    w, h = next(it, "").lower().split("x")
+                    self.max_size = (int(w), int(h))
+                except ValueError:
+                    pass
+            elif a == "--format":
                 ext = next(it, "").lower().lstrip(".")
                 match = [v for v in self.fmt_box["values"] if v.split()[0] == ext]
                 if match:
@@ -1203,7 +1221,7 @@ class App(tk.Tk):
         # copied after all), fall back to re-encoding audio, then everything.
         attempts = []
         for copy in ("va", "v", ""):
-            a = build_args(ext, quality, info, copy)
+            a = build_args(ext, quality, info, copy, self.max_size)
             if a not in attempts:
                 attempts.append(a)
 
@@ -1488,6 +1506,8 @@ class App(tk.Tk):
                 grid_start = 0.5 / fps if k else vstart
                 cut = [] if k == n - 1 else ["-frames:v", str(bounds[k + 1] - bounds[k])]
                 vf = f"fps={rate}:start_time={grid_start:.6f},setpts=PTS-STARTPTS"
+                if "-vf" in args:
+                    vf += "," + args[args.index("-vf") + 1]
                 jobs.append((part, ["-map", "0:v:0", "-an", "-sn", "-dn", "-vf", vf,
                                     *cut, *vargs], pre, tick(k)))
             if has_audio:
