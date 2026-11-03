@@ -266,7 +266,9 @@ _LO = "libreoffice-writer libreoffice-calc libreoffice-impress"
 TOOLS = {
     "ffmpeg": {
         "name": "FFmpeg", "purpose": "converting audio, video and subtitles",
-        "winget": "winget install -e --id Gyan.FFmpeg",
+        # --source winget: a broken Microsoft Store source (certificate errors) would
+        # otherwise make winget stop and ask which source to use
+        "winget": "winget install -e --id Gyan.FFmpeg --source winget",
         "url": "https://ffmpeg.org/download.html",
         "linux": [
             ("apt-get", "sudo apt install -y ffmpeg"),
@@ -280,7 +282,7 @@ TOOLS = {
     },
     "office": {
         "name": "LibreOffice", "purpose": "converting documents, slides and spreadsheets",
-        "winget": "winget install -e --id TheDocumentFoundation.LibreOffice",
+        "winget": "winget install -e --id TheDocumentFoundation.LibreOffice --source winget",
         "url": "https://www.libreoffice.org/download/download/",
         "linux": [
             ("apt-get", f"sudo apt install -y {_LO}"),
