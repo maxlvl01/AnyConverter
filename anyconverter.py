@@ -16,11 +16,17 @@ import importlib.util
 import io
 import json
 import os
+import platform
 import queue
 import tarfile
 import tempfile
+import traceback
+import urllib.request
+import uuid
 import zipfile
+from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 import re
 import shutil
 import subprocess
@@ -37,6 +43,7 @@ except ImportError:
              "  sudo pacman -S tk                (Arch)")
 
 IS_WIN = os.name == "nt"
+VERSION = "1.0"        # goes into bug reports
 
 # ---------------------------------------------------------------- formats ---
 
@@ -650,6 +657,122 @@ def write_table(rows, dst, ext):
         raise ValueError(ext)
 
 
+# ------------------------------------------------------------ bug reports ---
+
+# A report becomes a GitHub Issue in this repo (title "<category> (<version>)", label
+# "bug", the log folded away). If that fails (no internet) it waits in WAITING_REPORTS
+# and goes on the next start.
+ISSUES_URL = "https://api.github.com/repos/maxlvl01/AnyConverter/issues"
+TOKEN_FILE = "report-token.txt"     # not in git: only the builds carry it (see CLAUDE.md)
+WAITING_REPORTS = os.path.join(
+    os.environ.get("LOCALAPPDATA", tempfile.gettempdir()) if IS_WIN
+    else os.path.expanduser("~/.local/share"), "anyconverter", "bug-reports")
+LOG_LINES = 200
+REPORT_TEXT_MAX = 20_000    # what the user wrote
+ISSUE_BODY_MAX = 60_000     # GitHub takes 65,536 characters; the log is cut to stay under this
+
+LOG = deque(maxlen=LOG_LINES)    # (appending is safe from every thread)
+
+
+def log(text):
+    now = f"{datetime.now():%H:%M:%S}"
+    LOG.extend(f"{now}  {line}" for line in text.rstrip().splitlines())
+
+
+def read_token():
+    """The GitHub token reports are sent with, or None: this copy can't send any."""
+    here = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    try:
+        with open(os.path.join(here, TOKEN_FILE), encoding="utf-8") as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
+
+
+REPORT_TOKEN = read_token()
+
+
+def anonymise(text, folders=(), stems=()):
+    """text without the user's name, folders ("<folder>") and file names ("<file>")."""
+    home = os.path.expanduser("~")
+    places = {p for p in (*folders, home) if len(p) > 3}     # (not "C:\" or "/")
+    for p in sorted(places, key=len, reverse=True):
+        for spelling in (p, p.replace("\\", "/")):
+            text = re.sub(re.escape(spelling), "<folder>", text, flags=re.I)
+    users = {os.environ.get("USERNAME"), os.environ.get("USER"), os.path.basename(home)}
+    for words, new in ((stems, "<file>"), (users, "<user>")):
+        for w in sorted(filter(None, words), key=len, reverse=True):
+            # (whole words only: a file called "a" must not eat every a in the log)
+            text = re.sub(rf"(?<![^\W_]){re.escape(w)}(?![^\W_])", new, text, flags=re.I)
+    return text
+
+
+def make_report(category, text, details):
+    """The report from the template: what the app knows, then the user's text, then the log."""
+    built = "" if getattr(sys, "frozen", False) else " (from source)"
+    head = (f"- **Version:** {VERSION}{built}\n"
+            f"- **Date:** {datetime.now():%Y-%m-%d %H:%M} ({datetime.now(timezone.utc):%H:%M} UTC)\n"
+            f"- **System:** {platform.platform()} · Python {platform.python_version()}\n"
+            f"- **FFmpeg:** {'found' if FFMPEG else 'not found'}\n"
+            f"- **LibreOffice:** {'found' if SOFFICE else 'not found'}\n"
+            f"{details}\n"
+            f"## What happened\n\n{text.strip()[:REPORT_TEXT_MAX]}\n\n")
+    summary = f"Log (last {LOG_LINES} lines)"
+    logged = "\n".join(LOG) or "(nothing logged yet)"
+    room = ISSUE_BODY_MAX - len(head) - len(summary) - 60
+    if len(logged) > room:
+        logged = "…" + logged[-room:]
+    # (a longer fence, in case the log holds ``` itself)
+    return {"title": f"{category} ({VERSION})",
+            "body": f"{head}<details><summary>{summary}</summary>\n\n"
+                    f"````\n{logged}\n````\n\n</details>\n"}
+
+
+def create_issue(report):
+    """Opens the issue (label "bug") and returns its page. Raises if it can't."""
+    request = urllib.request.Request(
+        ISSUES_URL,
+        data=json.dumps({**report, "labels": ["bug"]}).encode("utf-8"),
+        headers={"Authorization": f"Bearer {REPORT_TOKEN}",
+                 "Accept": "application/vnd.github+json",
+                 "Content-Type": "application/json",
+                 "User-Agent": "AnyConverter"})
+    with urllib.request.urlopen(request, timeout=20) as answer:
+        return json.load(answer)["html_url"]
+
+
+def send_report(report):
+    """Sends a report, or keeps it for the next start. Returns whether it went."""
+    try:
+        log(f"Bug report sent: {create_issue(report)}")
+        return True
+    except Exception as e:
+        log(f"Couldn't send the bug report: {e}")
+    try:
+        os.makedirs(WAITING_REPORTS, exist_ok=True)
+        name = f"{datetime.now():%Y-%m-%d %H-%M} {uuid.uuid4().hex[:6]}.json"
+        with open(os.path.join(WAITING_REPORTS, name), "w", encoding="utf-8") as f:
+            json.dump(report, f)
+    except OSError as e:
+        log(f"Couldn't keep the bug report: {e}")
+    return False
+
+
+def send_waiting_reports():
+    """At the start: reports that couldn't go last time go now."""
+    if not REPORT_TOKEN or not os.path.isdir(WAITING_REPORTS):
+        return
+    for name in sorted(os.listdir(WAITING_REPORTS)):
+        path = os.path.join(WAITING_REPORTS, name)
+        try:
+            with open(path, encoding="utf-8") as f:
+                create_issue(json.load(f))
+            os.remove(path)
+        except Exception as e:      # (most likely still offline: the rest would fail too)
+            log(f"Couldn't send a waiting bug report: {e}")
+            return
+
+
 # --------------------------------------------------------------------- UI ---
 
 BG = "#0f1117"
@@ -816,6 +939,81 @@ class ToolDialog(tk.Toplevel):
                                  "seconds and try again.", fg=ERR)
 
 
+class BugDialog(tk.Toplevel):
+    """'Report a bug': one text box and Send. The category and what the app knows are
+    taken when it opens, so they describe what the user was looking at."""
+
+    def __init__(self, master):
+        super().__init__(master)
+        self.category = master.report_category()
+        self.details = master.report_details()
+        self.title("Report a bug")
+        self.configure(bg=BG)
+        self.resizable(False, False)
+        self.transient(master)
+
+        body = tk.Frame(self, bg=BG)
+        body.pack(fill="both", expand=True, padx=26, pady=22)
+
+        tk.Label(body, text="Report a bug", bg=BG, fg=FG,
+                 font=(FONT, 15, "bold")).pack(anchor="w")
+        tk.Label(body, text=f"Bug in: {self.category}", bg=BG, fg=MUTED,
+                 font=(FONT, 10)).pack(anchor="w", pady=(2, 12))
+        tk.Label(body, text="What happened? What did you do just before, and what did you expect?",
+                 bg=BG, fg=FG, font=(FONT, 10)).pack(anchor="w", pady=(0, 6))
+
+        self.box = tk.Text(body, width=58, height=9, wrap="word", bg=CARD2, fg=FG,
+                           insertbackground=FG, relief="flat", bd=0, padx=10, pady=8,
+                           font=(FONT, 10), highlightthickness=0)
+        self.box.pack(fill="x")
+        self.box.bind("<<Modified>>", self._changed)
+
+        tk.Label(body, bg=BG, fg=MUTED, font=(FONT, 9), justify="left", wraplength=470,
+                 text="AnyConverter adds its version, your system, the formats you're converting "
+                      "and the end of its log (your file names and user name are left out). "
+                      "It's posted as a public issue on GitHub, so please keep private details "
+                      "out of your text."
+                 ).pack(anchor="w", pady=(10, 4))
+        self.msg = tk.Label(body, text="", bg=BG, fg=ERR, font=(FONT, 9))
+        self.msg.pack(anchor="w", pady=(2, 10))
+
+        btns = tk.Frame(body, bg=BG)
+        btns.pack(fill="x")
+        self.send_btn = Button(btns, "Send", self.send, primary=True)
+        self.send_btn.pack(side="right")
+        self.send_btn.set_enabled(False)
+        Button(btns, "Cancel", self.destroy).pack(side="left")
+        if not REPORT_TOKEN:
+            self.msg.config(text="This version can't send reports (it has no key for it).")
+
+        self.update_idletasks()
+        x = master.winfo_rootx() + (master.winfo_width() - self.winfo_width()) // 2
+        y = master.winfo_rooty() + (master.winfo_height() - self.winfo_height()) // 3
+        self.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        self.grab_set()
+        self.box.focus_set()
+
+    def _changed(self, event):
+        self.box.edit_modified(False)
+        self.send_btn.set_enabled(bool(REPORT_TOKEN and self.box.get("1.0", "end").strip()))
+
+    def send(self):
+        self.send_btn.set_enabled(False)
+        self.box.config(state="disabled")
+        self.msg.config(text="Sending…", fg=MUTED)
+        report = make_report(self.category, self.box.get("1.0", "end"), self.details)
+        threading.Thread(target=lambda: self.master.msgs.put(
+            ("reported", self, send_report(report))), daemon=True).start()
+
+    def finished(self, ok):
+        if not self.winfo_exists():
+            return
+        self.msg.config(text="Thanks! Max will look at it." if ok else
+                        "Couldn't send it now: it goes the next time you start AnyConverter.",
+                        fg=OK if ok else ERR)
+        self.after(1500 if ok else 3000, self.destroy)
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -842,11 +1040,16 @@ class App(tk.Tk):
         self.merge = tk.BooleanVar(value=False)
         # (Quiznight opens AnyConverter with --max-size 1280x720: its videos needn't be bigger)
         self.max_size = None
+        # Every folder and file name seen, so the log can leave them out (also after "Clear")
+        self.folders = set()
+        self.stems = set()
+        threading.excepthook = self._thread_error
 
         self._style()
         self._build()
         self._apply_args(sys.argv[1:])
         self.after(100, self._poll)
+        threading.Thread(target=send_waiting_reports, daemon=True).start()
 
         if not FFMPEG:
             self.status.config(text="FFmpeg is not installed (needed for audio & video). "
@@ -877,6 +1080,43 @@ class App(tk.Tk):
     def show_tool_help(self, tool):
         ToolDialog(self, tool, on_found=lambda: self.status.config(
             text=f"{TOOLS[tool]['name']} found, you're all set!", fg=OK))
+
+    # ---- bug reports
+    def _log(self, text):
+        log(self._private(text))
+
+    def _private(self, text):
+        return anonymise(text, list(self.folders), list(self.stems))
+
+    def report_callback_exception(self, *exc):
+        """An error in a button or timer: built copies have no console to show it on."""
+        self._log("".join(traceback.format_exception(*exc)))
+        super().report_callback_exception(*exc)
+
+    def _thread_error(self, args):
+        self._log("".join(traceback.format_exception(
+            args.exc_type, args.exc_value, args.exc_traceback)))
+        threading.__excepthook__(args)
+
+    def report_category(self):
+        """What the report is about: the formats on screen, "mkv, mp4 → webm"."""
+        if not self.files:
+            return "General"
+        exts = sorted({split_ext(p)[1] or "no extension" for p in self.files})
+        shown = ", ".join(exts[:3]) + (" …" if len(exts) > 3 else "")
+        return f"{shown} → {self.fmt_box.get().split()[0]}"
+
+    def report_details(self):
+        """The report's lines about the app's state (never a file's name)."""
+        kinds = Counter(split_ext(p)[1] or "no extension" for p in self.files)
+        files = ", ".join(f"{n} {e}" for e, n in kinds.most_common()) or "none"
+        size = "x".join(map(str, self.max_size)) if self.max_size else "any"
+        return (f"- **Files:** {files}\n"
+                f"- **Quality / max size:** {self.quality.get()} / {size}\n"
+                f"- **Status:** {self._private(self.status.cget('text'))}\n")
+
+    def report_bug(self):
+        BugDialog(self)
 
     # ---- styling
     def _style(self):
@@ -914,6 +1154,7 @@ class App(tk.Tk):
 
         head = tk.Frame(self, bg=BG)
         head.pack(fill="x", pady=(20, 12), **pad)
+        Button(head, "Report a bug", self.report_bug).pack(side="right", pady=(8, 0))
         tk.Label(head, text="AnyConverter", bg=BG, fg=FG,
                  font=(FONT, 22, "bold")).pack(side="left")
         tk.Label(head, text="  audio, video, images, PDFs, documents & more", bg=BG, fg=MUTED,
@@ -1016,6 +1257,8 @@ class App(tk.Tk):
             p = os.path.normpath(p)
             if p not in self.files:
                 self.files.append(p)
+                self.folders.add(os.path.dirname(p))
+                self.stems.add(split_ext(p)[0])
                 self.tree.insert("", "end", iid=p, values=(os.path.basename(p), "Waiting"))
         self._refresh_count()
 
@@ -1072,6 +1315,7 @@ class App(tk.Tk):
         d = filedialog.askdirectory(title="Choose output folder")
         if d:
             self.outdir.set(os.path.normpath(d))
+            self.folders.add(self.outdir.get())
             self.out_lbl.config(text=self.outdir.get())
 
     def reset_outdir(self):
@@ -1112,6 +1356,8 @@ class App(tk.Tk):
             return
         for p in jobs:
             self.tree.item(p, values=(os.path.basename(p), "Waiting"), tags=())
+        self._log(f"Converting {len(jobs)} file(s) to {ext}, {self.quality.get()}"
+                  + (", combined" if merge else ""))
         self.cancelled = False
         self.go_btn.config(text="Cancel")
         self.add_btn.set_enabled(False)
@@ -1133,6 +1379,8 @@ class App(tk.Tk):
         self.reserved = set()
         if merge:
             ok = self._merge_pdf(jobs, quality, outdir)
+            if not ok:
+                self._log(f"Combining failed: {self._last_error[1]}")
             self.msgs.put(("finished", int(ok), int(not ok), self.cancelled, 0))
             return
         # Video encoders already use every core, so videos go one at a time.
@@ -1211,6 +1459,7 @@ class App(tk.Tk):
             self.msgs.put(("row", src, "✗ Failed", "err"))
             self.msgs.put(("log", os.path.basename(src), err))
             result = "fail"
+        self._log(f"{src} to {ext} ({engine}): {result}" + (f"\n{err}" if result == "fail" else ""))
         self.job_pct[src] = 100.0
         self.msgs.put(("progress", sum(self.job_pct.values()) / len(self.job_pct)))
         return result
@@ -1562,6 +1811,8 @@ class App(tk.Tk):
                 elif kind == "log":
                     print(f"--- {msg[1]} failed ---\n{msg[2]}\n", file=sys.stderr)
                     self._last_error = (msg[1], msg[2])
+                elif kind == "reported":
+                    msg[1].finished(msg[2])
                 elif kind == "finished":
                     _, done, failed, cancelled, skipped = msg
                     self.worker = None

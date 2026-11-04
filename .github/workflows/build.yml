@@ -1,6 +1,10 @@
 # Builds AnyConverter for Linux and Windows on GitHub's machines.
 # Push this folder to a GitHub repo, then open Actions -> "Build" -> Run workflow
-# (or push a tag like v1.0) and download the results from the run page.
+# and download the results from the run page. Pushing a tag like v1.0 does the
+# same and publishes them as a release: AnyConverter.exe and the Linux .tar.gz,
+# both portable (no installing needed).
+# Needs the repo secret REPORT_TOKEN (see CLAUDE.md): builds without it couldn't
+# send bug reports, so the run stops instead.
 name: Build
 
 on:
@@ -19,7 +23,13 @@ jobs:
           python-version: "3.12"
       - run: sudo apt-get update && sudo apt-get install -y python3-tk
       - run: pip install pyinstaller pillow pillow-heif pypdfium2 openpyxl
-      - run: pyinstaller --noconfirm --onefile --windowed --name AnyConverter anyconverter.py
+      - name: Write the bug report token
+        env:
+          REPORT_TOKEN: ${{ secrets.REPORT_TOKEN }}
+        run: |
+          [ -n "$REPORT_TOKEN" ] || { echo "::error::The REPORT_TOKEN secret is missing"; exit 1; }
+          printf %s "$REPORT_TOKEN" > report-token.txt
+      - run: pyinstaller --noconfirm --onefile --windowed --add-data "report-token.txt:." --name AnyConverter anyconverter.py
       - name: Smoke test (starts the app on a virtual screen)
         run: |
           sudo apt-get install -y xvfb
@@ -43,8 +53,37 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install pyinstaller pillow pillow-heif pypdfium2 openpyxl
-      - run: pyinstaller --noconfirm --onefile --windowed --name AnyConverter anyconverter.py
+      - name: Write the bug report token
+        shell: bash
+        env:
+          REPORT_TOKEN: ${{ secrets.REPORT_TOKEN }}
+        run: |
+          [ -n "$REPORT_TOKEN" ] || { echo "::error::The REPORT_TOKEN secret is missing"; exit 1; }
+          printf %s "$REPORT_TOKEN" > report-token.txt
+      - run: pyinstaller --noconfirm --onefile --windowed --add-data "report-token.txt:." --name AnyConverter anyconverter.py
       - uses: actions/upload-artifact@v4
         with:
           name: AnyConverter-windows
           path: dist/AnyConverter.exe
+
+  # A tag like v1.0 also publishes both builds as a GitHub release.
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [linux, windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - name: Publish, with this version's part of CHANGELOG.md as the text
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          notes=$(awk -v head="## [${GITHUB_REF_NAME#v}]" \
+            'index($0, head) == 1 {on = 1; next} /^## \[/ {on = 0} on' CHANGELOG.md)
+          [ -n "$notes" ] || { echo "::error::CHANGELOG.md has no section for $GITHUB_REF_NAME"; exit 1; }
+          gh release create "$GITHUB_REF_NAME" AnyConverter.exe AnyConverter-linux-x86_64.tar.gz \
+            --title "AnyConverter $GITHUB_REF_NAME" --notes "$notes"

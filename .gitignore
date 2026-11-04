@@ -3,3 +3,4 @@ dist/
 *.spec
 .venv-build/
 __pycache__/
+report-token.txt

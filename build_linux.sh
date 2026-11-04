@@ -20,7 +20,14 @@ python3 -c "import tkinter" 2>/dev/null || {
 python3 -m venv .venv-build
 .venv-build/bin/pip install --quiet --upgrade pip pyinstaller \
     pillow pillow-heif pypdfium2 openpyxl
-.venv-build/bin/pyinstaller --noconfirm --onefile --windowed \
+# The bug report token (gitignored): without it the build can't send reports.
+token=()
+if [[ -s report-token.txt ]]; then
+    token=(--add-data "report-token.txt:.")
+else
+    echo "Note: no report-token.txt, so this build can't send bug reports." >&2
+fi
+.venv-build/bin/pyinstaller --noconfirm --onefile --windowed "${token[@]}" \
     --name AnyConverter anyconverter.py
 
 echo
